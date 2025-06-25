@@ -1,0 +1,13 @@
+{
+  "apps": [
+    {
+      "name": "tcp_server",
+      "script": "tcp_device_server.py",
+      "cwd": "C:\\Users\\admin\\UBVisionProjects\\tcp_device_server",
+      "interpreter": "C:\\ProgramData\\Miniconda3\\python.exe",
+      "interpreter_args": "-u",
+      "windowsHide": true,
+      "log_file": "C:\\UBVisionData\\server.log"
+    }
+  ]
+}
