@@ -7,7 +7,7 @@ TCP 工业设备管理服务
 
 import asyncio
 import logging
-from logging.handlers import TimedRotatingFileHandler
+import logging.handlers
 import time
 import json
 import re
@@ -29,6 +29,11 @@ class DeviceManager:
         self.redis_host = redis_host
         self.redis_port = redis_port
         
+        # 粘包防护配置
+        self.MAX_MESSAGE_LENGTH = 16  # 单条消息最大长度（字节）
+        self.MAX_BUFFER_LENGTH = 64   # 缓冲区最大长度（字节）
+        self.REPEATED_PATTERN_CHECK_LENGTH = 32  # 重复模式检查触发长度（字节）
+        
         # 设备连接字典: device_id -> (transport, writer, last_heartbeat_time)
         self.devices: Dict[str, tuple] = {}
         self.devices_lock = asyncio.Lock()
@@ -49,26 +54,43 @@ class DeviceManager:
         self.setup_logging()
         self.logger = logging.getLogger(__name__)
         
+        # 记录粘包防护配置
+        self.logger.info(f"粘包防护配置 - 单条消息最大长度: {self.MAX_MESSAGE_LENGTH} bytes, 缓冲区最大长度: {self.MAX_BUFFER_LENGTH} bytes, 重复模式检查触发长度: {self.REPEATED_PATTERN_CHECK_LENGTH} bytes")
+        
+    def set_protection_limits(self, max_message_length: int = None, max_buffer_length: int = None, repeated_pattern_check_length: int = None):
+        """动态设置粘包防护限制"""
+        if max_message_length is not None:
+            self.MAX_MESSAGE_LENGTH = max_message_length
+            self.logger.info(f"更新单条消息最大长度限制: {self.MAX_MESSAGE_LENGTH} bytes")
+            
+        if max_buffer_length is not None:
+            self.MAX_BUFFER_LENGTH = max_buffer_length
+            self.logger.info(f"更新缓冲区最大长度限制: {self.MAX_BUFFER_LENGTH} bytes")
+            
+        if repeated_pattern_check_length is not None:
+            self.REPEATED_PATTERN_CHECK_LENGTH = repeated_pattern_check_length
+            self.logger.info(f"更新重复模式检查触发长度: {self.REPEATED_PATTERN_CHECK_LENGTH} bytes")
+        
     def setup_logging(self):
-        """配置日志系统 - 支持每天切割，只保留3天"""
+        """配置日志系统"""
         # 创建日志格式
         log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         date_format = '%Y-%m-%d %H:%M:%S'
         
-        # 创建定时轮转文件处理器 - 每天切割一次，保留3个备份（总共4天）
-        file_handler = TimedRotatingFileHandler(
-            filename='device_server.log',
-            when='midnight',  # 每天午夜切割
-            interval=1,       # 每1天
-            backupCount=3,    # 保留3个备份文件
+        # 创建按时间轮转的文件处理器
+        # when='D' 表示按天轮转，interval=1 表示每1天轮转一次
+        # backupCount=2 表示保留2个备份文件，加上当前文件共3天
+        file_handler = logging.handlers.TimedRotatingFileHandler(
+            filename='server.log',
+            when='D',
+            interval=1,
+            backupCount=2,
             encoding='utf-8'
         )
-        file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(logging.Formatter(log_format, date_format))
         
         # 创建控制台处理器
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.DEBUG)
         console_handler.setFormatter(logging.Formatter(log_format, date_format))
         
         # 配置根日志器 - 设置为DEBUG级别以便查看所有日志
@@ -120,6 +142,33 @@ class DeviceManager:
             self.logger.error(f"提取设备ID时发生错误: {e}, 消息: {message_str}")
             # 发生错误时使用客户端IP的最后一位作为设备ID
             return f"{client_addr[0].split('.')[-1]}"
+    
+    def is_repeated_hn_pattern(self, message_str: str) -> bool:
+        """检查消息是否为重复的Hn模式（如H1H1H1或H123H123H123）"""
+        try:
+            if not message_str or len(message_str) < 2:
+                return False
+            
+            # 使用正则表达式查找所有H后跟数字的模式
+            hn_patterns = re.findall(r'H\d+', message_str)
+            
+            # 如果找到的模式少于2个，不是重复模式
+            if len(hn_patterns) < 2:
+                return False
+            
+            # 检查是否所有找到的模式都相同
+            first_pattern = hn_patterns[0]
+            for pattern in hn_patterns[1:]:
+                if pattern != first_pattern:
+                    return False
+            
+            # 检查整个消息是否完全由重复的Hn模式组成
+            expected_message = first_pattern * len(hn_patterns)
+            return message_str == expected_message
+            
+        except Exception as e:
+            self.logger.error(f"检查重复Hn模式时发生错误: {e}, 消息: {message_str}")
+            return False
 
     async def process_message(self, message_str: str, client_addr: tuple, writer: asyncio.StreamWriter, device_id_container: list):
         """处理接收到的消息内容"""
@@ -127,17 +176,6 @@ class DeviceManager:
             # self.logger.info(f"收到消息: {message_str}")
             if not message_str:
                 self.logger.info(f"消息内容为空，跳过处理")
-                return
-            
-            # 检查消息长度，如果超过16个字符则断开客户端
-            if len(message_str) > 16:
-                self.logger.warning(f"客户端 {client_addr} 发送的消息长度超过16个字符({len(message_str)}个字符)，断开连接: {repr(message_str)}")
-                # 关闭客户端连接
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except Exception as e:
-                    self.logger.error(f"断开客户端 {client_addr} 连接时出错: {e}")
                 return
             
             # 检查是否以'A'开头，标记为动作执行客户端
@@ -214,15 +252,34 @@ class DeviceManager:
                     last_data_time = time.time()  # 更新最后数据接收时间
                     # self.logger.info(f"当前缓冲区内容: {repr(buffer)}")
                     
+                    # 当缓冲区达到一定长度时，优先检查是否为重复Hn模式
+                    if len(buffer) >= self.REPEATED_PATTERN_CHECK_LENGTH:
+                        try:
+                            buffer_str = buffer.decode('ascii').strip()
+                            if self.is_repeated_hn_pattern(buffer_str):
+                                buffer = b''  # 清空缓冲区，忽略重复模式数据
+                                continue  # 继续处理
+                        except UnicodeDecodeError:
+                            pass  # 如果解码失败，继续正常处理
+                    
                     # 查找换行符
                     while b'\n' in buffer:
                         line, buffer = buffer.split(b'\n', 1)
                         # self.logger.info(f"处理分割后的行: {repr(line)}, 剩余缓冲区: {repr(buffer)}")
                         
-                        # 检查行的大小，防止过大的数据包
-                        if len(line) > 1024 * 1024:  # 1MB限制
-                            self.logger.error(f"客户端 {client_addr} 发送的单行数据过大: {len(line)} bytes")
-                            continue
+                        # 优先检查是否为重复的Hn模式（如HnHnHn），如果是则忽略（不打印日志）
+                        try:
+                            line_str = line.decode('ascii').strip()
+                            if self.is_repeated_hn_pattern(line_str):
+                                continue  # 忽略该消息，继续处理下一条
+                        except UnicodeDecodeError:
+                            pass  # 如果解码失败，继续进行长度检查
+                        
+                        # 粘包防护：检查单条消息长度
+                        if len(line) > self.MAX_MESSAGE_LENGTH:
+                            self.logger.error(f"客户端 {client_addr} 发送的消息长度超过限制: {len(line)} > {self.MAX_MESSAGE_LENGTH} bytes, 数据: {repr(line[:50])}...")
+                            self.logger.error(f"疑似粘包攻击，强制断开客户端 {client_addr} 连接")
+                            return  # 直接返回，触发finally块中的连接清理
                         
                         if not line.strip():
                             self.logger.info(f"跳过空行数据")
@@ -236,10 +293,20 @@ class DeviceManager:
                         except Exception as e:
                             self.logger.error(f"处理消息时发生错误 from {client_addr}: {e}, 数据: {repr(line)}")
                     
-                    # 防止缓冲区无限增长
-                    if len(buffer) > 1024 * 1024:  # 1MB限制
-                        self.logger.error(f"客户端 {client_addr} 缓冲区过大，清空缓冲区")
-                        buffer = b''
+                    # 优先检查是否为重复的Hn模式，如果是则直接清空缓冲区
+                    try:
+                        buffer_str = buffer.decode('ascii').strip()
+                        if self.is_repeated_hn_pattern(buffer_str):
+                            buffer = b''  # 清空缓冲区，忽略该数据
+                            continue  # 继续处理
+                    except UnicodeDecodeError:
+                        pass  # 如果解码失败，继续进行长度检查
+                    
+                    # 粘包防护：防止缓冲区无限增长
+                    if len(buffer) > self.MAX_BUFFER_LENGTH:
+                        self.logger.error(f"客户端 {client_addr} 缓冲区长度超过限制: {len(buffer)} > {self.MAX_BUFFER_LENGTH} bytes")
+                        self.logger.error(f"疑似粘包攻击，强制断开客户端 {client_addr} 连接")
+                        return  # 直接返回，触发finally块中的连接清理
                         
                 except asyncio.TimeoutError:
                     # 读取超时，检查缓冲区是否有未处理的数据（没有换行符）
@@ -249,11 +316,20 @@ class DeviceManager:
                     if buffer and (current_time - last_data_time) >= 0.5:
                         # self.logger.info(f"检测到无换行符的消息，处理缓冲区内容: {repr(buffer)}")
                         
-                        # 检查数据大小
-                        if len(buffer) > 1024 * 1024:  # 1MB限制
-                            self.logger.error(f"客户端 {client_addr} 缓冲区数据过大: {len(buffer)} bytes")
-                            buffer = b''
-                            continue
+                        # 优先检查是否为重复的Hn模式（如HnHnHn），如果是则忽略（不打印日志）
+                        try:
+                            buffer_str = buffer.decode('ascii').strip()
+                            if self.is_repeated_hn_pattern(buffer_str):
+                                buffer = b''  # 清空缓冲区
+                                continue  # 继续等待新数据
+                        except UnicodeDecodeError:
+                            pass  # 如果解码失败，继续进行长度检查
+                        
+                        # 粘包防护：检查无换行符消息的长度
+                        if len(buffer) > self.MAX_MESSAGE_LENGTH:
+                            self.logger.error(f"客户端 {client_addr} 无换行符消息长度超过限制: {len(buffer)} > {self.MAX_MESSAGE_LENGTH} bytes, 数据: {repr(buffer[:50])}...")
+                            self.logger.error(f"疑似粘包攻击，强制断开客户端 {client_addr} 连接")
+                            return  # 直接返回，触发finally块中的连接清理
                         
                         try:
                             message_str = buffer.decode('ascii').strip()
@@ -278,12 +354,20 @@ class DeviceManager:
         finally:
             # 在连接关闭前，检查缓冲区是否还有未处理的数据
             if buffer:
-                self.logger.info(f"连接关闭前处理剩余缓冲区内容: {repr(buffer)}")
+                # 检查是否为重复的Hn模式（如HnHnHn），如果是则直接忽略（不打印日志）
                 try:
-                    message_str = buffer.decode('ascii').strip()
-                    if message_str:
-                        # 使用 create_task 进行非阻塞处理，避免阻塞客户端后续消息发送
-                        asyncio.create_task(self.process_message(message_str, client_addr, writer, device_id_container))
+                    buffer_str = buffer.decode('ascii').strip()
+                    if self.is_repeated_hn_pattern(buffer_str):
+                        pass  # 直接忽略，不做任何处理，也不打印日志
+                    else:
+                        self.logger.info(f"连接关闭前处理剩余缓冲区内容: {repr(buffer)}")
+                        # 粘包防护：检查关闭前缓冲区长度
+                        if len(buffer) > self.MAX_MESSAGE_LENGTH:
+                            self.logger.warning(f"连接关闭前缓冲区长度超过限制: {len(buffer)} > {self.MAX_MESSAGE_LENGTH} bytes, 跳过处理")
+                        else:
+                            if buffer_str:
+                                # 使用 create_task 进行非阻塞处理，避免阻塞客户端后续消息发送
+                                asyncio.create_task(self.process_message(buffer_str, client_addr, writer, device_id_container))
                 except UnicodeDecodeError as e:
                     self.logger.warning(f"缓冲区包含无效编码数据 from {client_addr}: {repr(buffer)}, 错误: {e}")
                 except Exception as e:
@@ -313,7 +397,7 @@ class DeviceManager:
                 pass
     
     async def heartbeat_checker(self):
-        """心跳检查协程 - 每1s检查一次设备超时"""
+        """心跳检查协程 - 每200ms检查一次设备超时"""
         self.logger.info("启动心跳检查器")
         
         while self.running:
@@ -332,7 +416,7 @@ class DeviceManager:
                             continue
                             
                         # 只对普通设备检查是否超过1秒未收到心跳
-                        if current_time - last_heartbeat > 1.5:
+                        if current_time - last_heartbeat > 2:
                             timeout_devices.append((device_id, transport, writer))
                             del self.devices[device_id]
                 
@@ -348,7 +432,7 @@ class DeviceManager:
                     except Exception as e:
                         self.logger.error(f"关闭超时设备 {device_id} 连接时出错: {e}")
                 
-                await asyncio.sleep(0.5)  # 500ms 检查间隔
+                await asyncio.sleep(0.2)  # 200ms 检查间隔
                 
             except Exception as e:
                 self.logger.error(f"心跳检查器发生错误: {e}")
